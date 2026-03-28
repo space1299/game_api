@@ -31,9 +31,11 @@ def normalize_nickname(nickname: str) -> str:
     return (nickname or "").strip().lower()
 
 
-def build_dedupe_key(nickname: str, season_id: int, window_rule_version: str) -> str:
+def build_dedupe_key(
+    nickname: str, season_id: int, matching_mode: int, window_rule_version: str
+) -> str:
     norm = normalize_nickname(nickname)
-    return f"{norm}|{season_id}|{window_rule_version}"
+    return f"{norm}|{season_id}|{matching_mode}|{window_rule_version}"
 
 
 def _serialize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -50,6 +52,19 @@ def _is_report_valid(doc: Dict[str, Any]) -> bool:
     if not isinstance(expires_at, datetime):
         return True
     return expires_at > utc_now()
+
+
+def _find_report_for_job(
+    job: Dict[str, Any], col_reports
+) -> Dict[str, Any] | None:
+    result_ref = job.get("result_ref")
+    if not result_ref:
+        return None
+
+    report = col_reports.find_one({"_id": str(result_ref)})
+    if not report or not _is_report_valid(report):
+        return None
+    return report
 
 
 def _upsert_job(nickname: str, season_id: int, dedupe_key: str) -> Dict[str, Any]:
@@ -117,16 +132,48 @@ def get_user_report(request: Request, nickname: str = Query(...)):
         logger.warning("current season not available")
         raise HTTPException(status_code=503, detail="current season not available")
 
-    dedupe_key = build_dedupe_key(nickname, season_id, REPORT_WINDOW_RULE_VERSION)
+    matching_mode = 3
+    dedupe_key = build_dedupe_key(
+        nickname, season_id, matching_mode, REPORT_WINDOW_RULE_VERSION
+    )
     ctx = build_db_context()
+    col_jobs = ctx.report.report_jobs
     col_reports = ctx.view.user_reports
 
-    report = col_reports.find_one({"dedupe_key": dedupe_key})
-    if report and _is_report_valid(report):
+    existing_job = col_jobs.find_one({"dedupe_key": dedupe_key})
+    if existing_job:
+        report = _find_report_for_job(existing_job, col_reports)
+        if report:
+            logger.info(
+                "report resolved via job result_ref: nickname=%s season_id=%s job_id=%s",
+                nickname,
+                season_id,
+                existing_job.get("_id"),
+            )
+            return {"status": "done", "report": _serialize_doc(report)}
+
+        if existing_job.get("status") in ("queued", "running"):
+            logger.info(
+                "existing job reused: nickname=%s season_id=%s job_id=%s status=%s",
+                nickname,
+                season_id,
+                existing_job.get("_id"),
+                existing_job.get("status"),
+            )
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": existing_job.get("status"),
+                    "jobId": str(existing_job.get("_id")),
+                },
+            )
+
+    job = _upsert_job(nickname, season_id, dedupe_key)
+    report = _find_report_for_job(job, col_reports)
+    if report:
         logger.info("report cache hit: nickname=%s season_id=%s", nickname, season_id)
         return {"status": "done", "report": _serialize_doc(report)}
 
-    job = _upsert_job(nickname, season_id, dedupe_key)
     logger.info(
         "job upserted: nickname=%s season_id=%s job_id=%s",
         nickname,
