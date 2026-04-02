@@ -43,10 +43,10 @@ def get_versions(request: Request) -> List[str]:
     db = build_db_context()
     col = db.view.versions
 
-    docs = list(col.find({}, {"_id": 0, "version_str": 1}))
+    docs = list(col.find({}, {"_id": 0, "versionStr": 1}))
     versions: List[str] = []
     for d in docs:
-        v = d.get("version_str")
+        v = d.get("versionStr")
         if isinstance(v, str) and v.strip():
             versions.append(v.strip())
 
